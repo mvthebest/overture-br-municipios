@@ -98,7 +98,8 @@ jobs:
                   sources AS sources, addresses[1] AS address,
                   bbox.xmin AS lon, bbox.ymin AS lat
                 FROM read_parquet('{source}', hive_partitioning=true)
-                WHERE addresses[1].country='BR' AND names['primary'] IS NOT NULL
+                WHERE bbox.xmin BETWEEN -74 AND -34.7 AND bbox.ymin BETWEEN -33.8 AND 5.3
+                  AND addresses[1].country='BR' AND names['primary'] IS NOT NULL
                   AND len(phones)>0 AND confidence >= {CONFIDENCE}
                   AND coalesce(operating_status,'') NOT IN ('permanently_closed','closed')
               ) TO '{raw}' (FORMAT JSON)
@@ -145,13 +146,27 @@ jobs:
                           seen.add(k)
                           rows.append(r)
                       source_file.unlink()
-                  target = OUT / f'{cid}.json.gz'
-                  with gzip.open(target, 'wt', encoding='utf-8', compresslevel=6) as f:
-                      json.dump(rows, f, ensure_ascii=False, separators=(',', ':'))
-                  if target.stat().st_size >= 90_000_000:
-                      raise RuntimeError('City file exceeds distribution safety limit.')
+                  parts = []
+                  if len(rows) > 2000:
+                      groups = collections.defaultdict(list)
+                      for row in rows:
+                          groups[(row['cat'],row['sub'])].append(row)
+                      for (cat,sub), group in groups.items():
+                          for start in range(0,len(group),500):
+                              part_rows=group[start:start+500]
+                              filename=f'{cid}--{len(parts):04d}.json.gz'
+                              with gzip.open(OUT/filename,'wt',encoding='utf-8',compresslevel=6) as f:
+                                  json.dump(part_rows,f,ensure_ascii=False,separators=(',',':'))
+                              parts.append({'file':filename,'cat':cat,'sub':sub,'count':len(part_rows),'bytes':(OUT/filename).stat().st_size})
+                      (OUT/f'{cid}.index.json').write_text(json.dumps({'parts':parts},ensure_ascii=False,separators=(',',':')))
+                      city['partitioned']=True
+                      city['bytes']=sum(p['bytes'] for p in parts)
+                  else:
+                      target = OUT / f'{cid}.json.gz'
+                      with gzip.open(target, 'wt', encoding='utf-8', compresslevel=6) as f:
+                          json.dump(rows, f, ensure_ascii=False, separators=(',', ':'))
+                      city['bytes']=target.stat().st_size
                   city['count'] = len(rows)
-                  city['bytes'] = target.stat().st_size
                   all_bytes += city['bytes']
                   unique += len(rows)
               manifest = {
