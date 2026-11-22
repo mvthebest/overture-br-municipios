@@ -1,0 +1,181 @@
+name: Build municipal Overture extracts
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: municipal-data-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install query engine
+        run: pip install duckdb==1.4.3
+      - name: Generate open-data extracts
+        run: |
+          python3 - <<'PYDATA'
+          #!/usr/bin/env python3
+          """Build municipal extracts from public Overture Places and the IBGE city list.
+          No credentials or application/customer data are read by this program.
+          """
+          import collections
+          import gzip
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import time
+          import unicodedata
+          import urllib.request
+          from urllib.parse import urlparse
+          
+          import duckdb
+          
+          RELEASE = '2026-11-18.0'
+          OUT = Path('data')
+          TMP = Path('/tmp/overture-build')
+          CONFIDENCE = 0.7
+          
+          def get_json(url):
+              with urllib.request.urlopen(url, timeout=120) as r:
+                  return json.load(r)
+          
+          def norm(s):
+              return ''.join(c for c in unicodedata.normalize('NFD', s or '') if not unicodedata.combining(c)).lower().strip()
+          
+          def state_of(m):
+              micro = m.get('microrregiao')
+              if micro:
+                  return micro['mesorregiao']['UF']['sigla']
+              return m['regiao-imediata']['regiao-intermediaria']['UF']['sigla']
+          
+          def main():
+              started = time.time()
+              OUT.mkdir(exist_ok=True)
+              licenses=Path('LICENSES')
+              licenses.mkdir(exist_ok=True)
+              for name,url in {
+                  'CDLA-Permissive-2.0.html':'https://cdla.dev/permissive-2-0/',
+                  'Apache-2.0.txt':'https://www.apache.org/licenses/LICENSE-2.0',
+                  'Foursquare-NOTICE.html':'https://opensource.foursquare.com/places-notice-txt/',
+              }.items():
+                  with urllib.request.urlopen(url,timeout=120) as r:
+                      (licenses/name).write_bytes(r.read())
+              Path('NOTICE.md').write_text('''# Sources and notices
+          
+          Overture Maps Foundation, https://overturemaps.org . Places release 2026-11-18.0.
+          Original sources and licenses are preserved per record. See LICENSES/ and
+          https://docs.overturemaps.org/attribution/ . Foursquare: Copyright 2024 Foursquare
+          Labs, Inc. All rights reserved. Available under Apache 2.0. Data was transformed
+          to the Overture schema and here grouped by address municipality; fields selected,
+          confidence threshold applied and duplicates removed. Meta, Microsoft, BrightQuery,
+          PinMeTo and other CDLA sources retain their original licensing. AllThePlaces: CC0.
+          IBGE municipality names and identifiers: https://servicodados.ibge.gov.br/ .
+          No record is an endorsement or proof that a business lacks a website.
+          ''')
+              TMP.mkdir(exist_ok=True)
+              cities = get_json('https://servicodados.ibge.gov.br/api/v1/localidades/municipios?orderBy=nome')
+              city_map = {(norm(m['nome']), state_of(m)): str(m['id']) for m in cities}
+              index = {str(m['id']): {'name': m['nome'], 'uf': state_of(m), 'count': 0} for m in cities}
+              con = duckdb.connect()
+              con.execute("SET memory_limit='8GB'; SET temp_directory='/tmp/duckdb-spill'; INSTALL httpfs; LOAD httpfs;")
+              con.execute("SET s3_region='us-west-2';")
+              source = f's3://overturemaps-us-west-2/release/{RELEASE}/theme=places/type=place/*'
+              raw = TMP / 'raw.jsonl'
+              # Exact country, confidence threshold and active/unknown status. The address
+              # supplies municipality and UF; unmatched locality names are counted, not
+              # silently assigned to a neighbour through a bounding rectangle.
+              con.execute(f"""COPY (
+                SELECT id, names['primary'] AS n, basic_category AS cat,
+                  taxonomy['primary'] AS sub, phones AS phones, websites AS websites,
+                  socials AS socials, emails AS emails, confidence AS confidence,
+                  sources AS sources, addresses[1] AS address,
+                  bbox.xmin AS lon, bbox.ymin AS lat
+                FROM read_parquet('{source}', hive_partitioning=true)
+                WHERE addresses[1].country='BR' AND names['primary'] IS NOT NULL
+                  AND len(phones)>0 AND confidence >= {CONFIDENCE}
+                  AND coalesce(operating_status,'') NOT IN ('permanently_closed','closed')
+              ) TO '{raw}' (FORMAT JSON)
+              """)
+              print('download_seconds', round(time.time()-started), 'bytes', raw.stat().st_size, flush=True)
+              handles = collections.OrderedDict()
+              missing = collections.Counter()
+              total = 0
+              for line in raw.open():
+                  r = json.loads(line)
+                  a = r['address'] or {}
+                  uf = (a.get('region') or '').replace('BR-', '')
+                  cid = city_map.get((norm(a.get('locality')), uf))
+                  if not cid:
+                      missing[(a.get('locality'), uf)] += 1
+                      continue
+                  # Keep source IDs and all website values. No website in this extract is
+                  # only a missing field, not evidence that no real website exists.
+                  r['address'] = ' - '.join(x for x in [a.get('freeform'), a.get('locality'), uf] if x)
+                  if cid not in handles:
+                      if len(handles) >= 32:
+                          _, h = handles.popitem(last=False)
+                          h.close()
+                      handles[cid] = (TMP / f'{cid}.jsonl').open('a')
+                  handles.move_to_end(cid)
+                  handles[cid].write(json.dumps(r, ensure_ascii=False, separators=(',', ':'))+'\n')
+                  total += 1
+              for h in handles.values():
+                  h.close()
+              raw.unlink()
+              all_bytes = 0
+              unique = 0
+              for cid, city in index.items():
+                  source_file = TMP / f'{cid}.jsonl'
+                  rows = []
+                  seen = set()
+                  if source_file.exists():
+                      for line in source_file.open():
+                          r = json.loads(line)
+                          phone = re.sub(r'\D', '', r['phones'][0])
+                          k = (norm(r['n']), phone)
+                          if k in seen:
+                              continue
+                          seen.add(k)
+                          rows.append(r)
+                      source_file.unlink()
+                  target = OUT / f'{cid}.json.gz'
+                  with gzip.open(target, 'wt', encoding='utf-8', compresslevel=6) as f:
+                      json.dump(rows, f, ensure_ascii=False, separators=(',', ':'))
+                  if target.stat().st_size >= 90_000_000:
+                      raise RuntimeError('City file exceeds distribution safety limit.')
+                  city['count'] = len(rows)
+                  city['bytes'] = target.stat().st_size
+                  all_bytes += city['bytes']
+                  unique += len(rows)
+              manifest = {
+                  'release': RELEASE, 'confidenceMin': CONFIDENCE,
+                  'assignment': 'Normalized address locality plus exact UF from Overture. No bbox-neighbour assignment.',
+                  'cities': index, 'total': unique, 'compressedBytes': all_bytes,
+                  'unmatched': sum(missing.values()), 'buildSeconds': round(time.time()-started),
+                  'source': 'https://docs.overturemaps.org/guides/places/',
+                  'citySource': 'https://servicodados.ibge.gov.br/api/v1/localidades/municipios?orderBy=nome',
+                  'limitations': ['Address locality mismatch can omit records.', 'A city with zero records is not proof of no businesses.', 'Phone and website fields may be outdated.', 'Coverage is not a complete business census.'],
+              }
+              (OUT/'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, separators=(',', ':')))
+              (OUT/'unmatched-summary.json').write_text(json.dumps([{'locality':k[0], 'uf':k[1], 'count':v} for k,v in missing.most_common(100)], ensure_ascii=False))
+              print(json.dumps({k:manifest[k] for k in ['total','compressedBytes','unmatched','buildSeconds']}), flush=True)
+              if all_bytes > 800_000_000:
+                  raise RuntimeError('Dataset exceeds repository safety budget; do not publish.')
+          
+          if __name__ == '__main__':
+              main()
+          PYDATA
+      - name: Publish generated open data only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data LICENSES NOTICE.md
+          git commit -m 'Generate municipal Overture Places extracts' || exit 0
+          git push
